@@ -1,11 +1,35 @@
+
 from flask import Flask, render_template_string, request, send_file, jsonify
 import subprocess
 import os
 import tempfile
-import uuid
+import threading
+import time
 import glob
+import uuid
 
 app = Flask(__name__)
+
+# Store job status
+jobs = {}
+
+# Cleanup old files periodically
+def cleanup_old_jobs():
+    while True:
+        time.sleep(300)  # Every 5 minutes
+        now = time.time()
+        to_delete = [jid for jid, job in jobs.items() if now - job.get('created', now) > 1800]  # 30 min
+        for jid in to_delete:
+            if jobs[jid].get('file') and os.path.exists(jobs[jid]['file']):
+                try:
+                    os.remove(jobs[jid]['file'])
+                    os.rmdir(os.path.dirname(jobs[jid]['file']))
+                except:
+                    pass
+            del jobs[jid]
+
+cleanup_thread = threading.Thread(target=cleanup_old_jobs, daemon=True)
+cleanup_thread.start()
 
 HTML = """
 <!DOCTYPE html>
@@ -79,19 +103,40 @@ HTML = """
         .status.error p { color: #e74c3c; }
         .status.success { border: 1px solid rgba(46,204,113,0.4); }
         .status.success p { color: #2ecc71; }
-        .spinner {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid rgba(255,255,255,0.3);
-            border-top-color: white;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-            margin-right: 10px;
-            vertical-align: middle;
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 4px;
+            margin-top: 15px;
+            overflow: hidden;
         }
-        @keyframes spin { to { transform: rotate(360deg); } }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #1DA1F2, #2ecc71);
+            border-radius: 4px;
+            transition: width 0.3s;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        .download-btn {
+            display: inline-block;
+            margin-top: 15px;
+            padding: 14px 30px;
+            background: linear-gradient(135deg, #2ecc71, #27ae60);
+            color: white;
+            text-decoration: none;
+            border-radius: 10px;
+            font-weight: 700;
+            font-size: 15px;
+            transition: all 0.3s;
+        }
+        .download-btn:hover { transform: translateY(-2px); box-shadow: 0 10px 25px rgba(46,204,113,0.35); }
         .info { margin-top: 35px; color: #444; font-size: 12px; }
+        .timer { color: #1DA1F2; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -101,17 +146,24 @@ HTML = """
         <p class="subtitle">Paste a Twitter/X Space URL and get the audio file</p>
         
         <input type="text" id="url" placeholder="https://x.com/username/status/123456789">
-        <button id="btn" onclick="download()">⬇️ Download Space</button>
+        <button id="btn" onclick="startDownload()">⬇️ Download Space</button>
         
         <div class="status" id="status">
             <p id="statusText"></p>
+            <div class="progress-bar" id="progressBar" style="display:none;">
+                <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+            </div>
         </div>
         
-        <p class="info">Supports twitter.com and x.com URLs</p>
+        <p class="info">Supports twitter.com and x.com URLs<br>Long recordings may take several minutes</p>
     </div>
     
     <script>
-        async function download() {
+        let currentJobId = null;
+        let pollInterval = null;
+        let startTime = null;
+        
+        async function startDownload() {
             const url = document.getElementById('url').value.trim();
             const btn = document.getElementById('btn');
             
@@ -120,36 +172,66 @@ HTML = """
                 return showStatus('Please enter a valid Twitter/X URL', 'error');
             
             btn.disabled = true;
-            btn.innerHTML = '<span class="spinner"></span> Downloading...';
-            showStatus('⏳ Fetching Space... This may take 1-3 minutes for long recordings.', '');
+            btn.textContent = '⏳ Starting...';
+            showStatus('🚀 Starting download...', '');
+            document.getElementById('progressBar').style.display = 'block';
+            document.getElementById('progressFill').style.width = '5%';
             
             try {
-                const resp = await fetch('/download', {
+                const resp = await fetch('/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ url })
                 });
                 
-                if (resp.ok) {
-                    const blob = await resp.blob();
-                    const filename = resp.headers.get('X-Filename') || 'space_audio.m4a';
-                    
-                    const a = document.createElement('a');
-                    a.href = URL.createObjectURL(blob);
-                    a.download = filename;
-                    a.click();
-                    
-                    showStatus('✅ Download started! Check your downloads folder.', 'success');
+                const data = await resp.json();
+                
+                if (data.job_id) {
+                    currentJobId = data.job_id;
+                    startTime = Date.now();
+                    pollInterval = setInterval(checkStatus, 2000);
                 } else {
-                    const data = await resp.json();
-                    showStatus('❌ ' + (data.error || 'Download failed'), 'error');
+                    showStatus('❌ ' + (data.error || 'Failed to start'), 'error');
+                    resetBtn();
                 }
             } catch (e) {
                 showStatus('❌ Error: ' + e.message, 'error');
+                resetBtn();
             }
+        }
+        
+        async function checkStatus() {
+            if (!currentJobId) return;
             
-            btn.disabled = false;
-            btn.innerHTML = '⬇️ Download Space';
+            try {
+                const resp = await fetch('/status/' + currentJobId);
+                const data = await resp.json();
+                
+                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                const mins = Math.floor(elapsed / 60);
+                const secs = elapsed % 60;
+                const timeStr = mins > 0 ? mins + 'm ' + secs + 's' : secs + 's';
+                
+                if (data.status === 'downloading') {
+                    document.getElementById('progressFill').style.width = '30%';
+                    showStatus('⏳ Downloading audio chunks... <span class="timer">' + timeStr + '</span><br><small>Long Spaces may take several minutes</small>', '');
+                } else if (data.status === 'processing') {
+                    document.getElementById('progressFill').style.width = '70%';
+                    showStatus('🔧 Processing audio... <span class="timer">' + timeStr + '</span>', '');
+                } else if (data.status === 'completed') {
+                    clearInterval(pollInterval);
+                    document.getElementById('progressFill').style.width = '100%';
+                    showStatus('✅ Ready! <span class="timer">Completed in ' + timeStr + '</span><br><br><a href="/download/' + currentJobId + '" class="download-btn">💾 Save Audio File</a>', 'success');
+                    resetBtn();
+                } else if (data.status === 'error') {
+                    clearInterval(pollInterval);
+                    document.getElementById('progressBar').style.display = 'none';
+                    showStatus('❌ ' + data.message, 'error');
+                    resetBtn();
+                }
+            } catch (e) {
+                // Keep trying
+            }
         }
         
         function showStatus(msg, type) {
@@ -158,20 +240,71 @@ HTML = """
             document.getElementById('statusText').innerHTML = msg;
         }
         
+        function resetBtn() {
+            const btn = document.getElementById('btn');
+            btn.disabled = false;
+            btn.textContent = '⬇️ Download Space';
+        }
+        
         document.getElementById('url').addEventListener('keypress', e => {
-            if (e.key === 'Enter') download();
+            if (e.key === 'Enter') startDownload();
         });
     </script>
 </body>
 </html>
 """
 
+def download_worker(job_id, url):
+    """Background worker to download the space"""
+    try:
+        jobs[job_id]['status'] = 'downloading'
+        jobs[job_id]['message'] = 'Downloading audio...'
+        
+        temp_dir = tempfile.mkdtemp()
+        output_template = os.path.join(temp_dir, '%(title)s.%(ext)s')
+        
+        # Run yt-dlp
+        process = subprocess.Popen(
+            ['yt-dlp', '-o', output_template, '--no-warnings', url],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        
+        # Monitor output
+        for line in process.stdout:
+            if 'Downloading' in line or 'download' in line.lower():
+                jobs[job_id]['status'] = 'downloading'
+            elif 'Merging' in line or 'ffmpeg' in line.lower():
+                jobs[job_id]['status'] = 'processing'
+        
+        process.wait()
+        
+        if process.returncode == 0:
+            files = glob.glob(os.path.join(temp_dir, '*.*'))
+            if files:
+                jobs[job_id]['status'] = 'completed'
+                jobs[job_id]['file'] = files[0]
+                jobs[job_id]['filename'] = os.path.basename(files[0])
+            else:
+                jobs[job_id]['status'] = 'error'
+                jobs[job_id]['message'] = 'No file was downloaded'
+        else:
+            jobs[job_id]['status'] = 'error'
+            jobs[job_id]['message'] = 'Download failed. Space may not be recorded or has expired.'
+            
+    except Exception as e:
+        jobs[job_id]['status'] = 'error'
+        jobs[job_id]['message'] = str(e)
+
+
 @app.route('/')
 def index():
     return render_template_string(HTML)
 
-@app.route('/download', methods=['POST'])
-def download():
+
+@app.route('/start', methods=['POST'])
+def start_download():
     url = request.json.get('url', '').strip()
     
     if not url:
@@ -180,48 +313,48 @@ def download():
     if 'twitter.com' not in url and 'x.com' not in url:
         return jsonify({'error': 'Invalid URL'}), 400
     
-    # Create temp directory
-    temp_dir = tempfile.mkdtemp()
-    output_template = os.path.join(temp_dir, '%(title)s.%(ext)s')
+    job_id = str(uuid.uuid4())[:8]
+    jobs[job_id] = {
+        'status': 'starting',
+        'message': 'Starting download...',
+        'file': None,
+        'filename': None,
+        'created': time.time()
+    }
     
-    try:
-        # Run yt-dlp
-        result = subprocess.run(
-            ['yt-dlp', '-o', output_template, url],
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 min timeout
-        )
-        
-        if result.returncode != 0:
-            error_msg = 'Download failed. '
-            if 'not recorded' in result.stderr.lower():
-                error_msg += 'Space was not recorded by host.'
-            elif 'expired' in result.stderr.lower():
-                error_msg += 'Recording has expired (30 day limit).'
-            else:
-                error_msg += 'Space may not exist or is not available.'
-            return jsonify({'error': error_msg}), 400
-        
-        # Find downloaded file
-        files = glob.glob(os.path.join(temp_dir, '*.*'))
-        if not files:
-            return jsonify({'error': 'No file was downloaded'}), 400
-        
-        filepath = files[0]
-        filename = os.path.basename(filepath)
-        
-        return send_file(
-            filepath,
-            as_attachment=True,
-            download_name=filename,
-            mimetype='audio/mp4'
-        ), 200, {'X-Filename': filename}
-        
-    except subprocess.TimeoutExpired:
-        return jsonify({'error': 'Download timed out (max 5 minutes)'}), 400
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    thread = threading.Thread(target=download_worker, args=(job_id, url))
+    thread.daemon = True
+    thread.start()
+    
+    return jsonify({'job_id': job_id})
+
+
+@app.route('/status/<job_id>')
+def check_status(job_id):
+    if job_id not in jobs:
+        return jsonify({'status': 'error', 'message': 'Job not found'}), 404
+    
+    return jsonify(jobs[job_id])
+
+
+@app.route('/download/<job_id>')
+def download_file(job_id):
+    if job_id not in jobs:
+        return "Job not found", 404
+    
+    job = jobs[job_id]
+    if job['status'] != 'completed' or not job['file']:
+        return "File not ready", 400
+    
+    if not os.path.exists(job['file']):
+        return "File no longer available", 404
+    
+    return send_file(
+        job['file'],
+        as_attachment=True,
+        download_name=job['filename']
+    )
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
